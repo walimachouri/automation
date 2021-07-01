@@ -1,0 +1,290 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: "CloudFormation - Task Linux VM Setup"
+
+Parameters:
+  KeyName:
+    Default: "EC2Key"
+    Description: "Name of an existing EC2 KeyPair to enable SSH access to the instance"
+    Type: "AWS::EC2::KeyPair::KeyName"
+    ConstraintDescription: Name of an existing EC2 KeyPair.
+  InstanceType:
+    Description: "The EC2 instance type."
+    Type: String
+    Default: t2.large
+    AllowedValues:
+      - t1.micro
+      - t2.nano
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t2.large
+    ConstraintDescription: must be a valid EC2 instance type.
+  CidrBlock:
+    Description: "The CIDR block that the VPC should use. Example: 10.0.0.0/16"
+    Type: String
+    MinLength: "9"
+    MaxLength: "18"
+    Default: 10.0.0.0/16
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+  LimitedSSHAccess:
+    Description: "Enter CIDR for network that may access via SSH"
+    Type: String
+    MinLength: "9"
+    MaxLength: "18"
+    Default: 0.0.0.0/0
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+
+# Mapping define what machines can be used
+Mappings:
+  AWSInstanceType2Arch:
+    t1.micro:
+      Arch: HVM64
+    t2.nano:
+      Arch: HVM64
+    t2.micro:
+      Arch: HVM64
+    t2.small:
+      Arch: HVM64
+    t2.medium:
+      Arch: HVM64
+    t2.large:
+      Arch: HVM64
+  AWSRegionArch2AMI:
+    us-east-1:
+      HVM64: ami-0ab4d1e9cf9a1215a
+      HVMG2: ami-0a584ac55a7631c0c
+    us-west-2:
+      HVM64: ami-a0cfeed8
+      HVMG2: ami-0e09505bc235aa82d
+    us-west-1:
+      HVM64: ami-0bdb828fd58c52235
+      HVMG2: ami-066ee5fd4a9ef77f1
+    eu-west-1:
+      HVM64: ami-047bb4163c506cd98
+      HVMG2: ami-0a7c483d527806435
+
+########
+# This is the section where we define all our services/resources that we use
+Resources:
+  # Define an EC2 instance. This is our virtual machine
+  VM:
+    Type: "AWS::EC2::Instance"
+    #install docker
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          ec2_bootstrap:
+            - install_docker
+        install_docker:
+          packages:
+            yum:
+              docker: []
+          services:
+            sysvinit:
+              docker:
+                enabled: "true"
+                ensureRunning: "true"
+          files:
+            "/etc/cfn/cfn-hup.conf":
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+              mode: "000400"
+              owner: "root"
+              group: "root"
+            "/etc/cfn/hooks.d/cfn-auto-reloader.conf":
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.VM.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource VM --region ${AWS::Region}
+              mode: "000400"
+              owner: "root"
+              group: "root"
+          commands:
+            docker_for_ec2_user:
+              command: usermod -G docker ec2-user
+    Properties:
+      # Define the image that should be used for the VM
+      ImageId: !FindInMap
+        - AWSRegionArch2AMI
+        - !Ref "AWS::Region"
+        - !FindInMap
+          - AWSInstanceType2Arch
+          - !Ref InstanceType
+          - Arch
+
+      # This defines the volume that should be mounted to the virtual machine.
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp2
+            VolumeSize: 8
+            DeleteOnTermination: true
+            Encrypted: false
+
+      InstanceType: !Ref InstanceType
+      # Associate the authetntication key that should be used.
+      KeyName: !Ref KeyName
+
+      # Associate Subnet
+      SubnetId: !Ref VMSubnet
+
+      # Associate Security Groups
+      SecurityGroupIds:
+        - !Ref VMSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+
+          function cfn_fail
+          {
+              cfn-signal -e 1 --stack ${AWS::StackName} \
+                  --resource VM \
+                  --region ${AWS::Region}
+              exit 1
+          }
+
+          function cfn_success
+          {
+              cfn-signal -e 0 --stack ${AWS::StackName} \
+                  --resource VM \
+                  --region ${AWS::Region}
+              exit 0
+          }
+
+          yum -y install git python3-pip
+
+          until git clone https://github.com/aws-quickstart/quickstart-linux-utilities; do
+              echo "Retrying...";
+          done
+          cd quickstart-linux-utilities;
+          source quickstart-cfn-tools.source;
+          qs_update-os || qs_err;
+          qs_bootstrap_pip || qs_err "pip bootstrap failed ";
+          qs_aws-cfn-bootstrap || qs_err "CFN bootstrap failed ";
+          echo "Executing config-sets";
+          cfn-init -v --stack ${AWS::StackName} \
+              --resource VM \
+              --configsets ec2_bootstrap \
+              --region ${AWS::Region} || cfn_fail
+          [ $(qs_status) == 0 ] && cfn_success || cfn_fail
+      # Set a tag, for ease of use to recognize this VM more easily
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}
+
+  # This defines the Security Group, used for the VM above
+  VMSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: Enable SSH and general HTTP Access
+      SecurityGroupIngress:
+        # Configure HTTP access
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+        # Configure (and limit) SSH access
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref LimitedSSHAccess
+
+      # Assign Security Group to a VPC
+      VpcId: !Ref VMvpc
+
+      # Set a tag, for ease of use to recognize the Security Group easier.
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}
+
+  # This defines the VPC
+  VMvpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref CidrBlock
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      InstanceTenancy: default
+
+      # Set a tag, for ease of use to recognize the VPC easier
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}
+
+  # This defines the Internet Gateway
+  VMInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      # Set a tag, for ease of use to recognize the Internet Gateway easier
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}
+
+  # This attaches the Internet Gateway (IGW) to a VPC
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    # Note: You can't attach an IGW to a VPC unless both are created:
+    Properties:
+      VpcId: !Ref VMvpc
+      InternetGatewayId: !Ref VMInternetGateway
+
+  # This defines a Subnet
+  VMSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      # Link to the VPC the Subnet belongs to
+      VpcId: !Ref VMvpc
+
+      # Define the Cidr block
+      CidrBlock: 10.0.0.0/16
+
+      AvailabilityZone: !Select
+        - "0"
+        - !GetAZs "" # Get the first AZ in the list
+
+      # Set a tag, for ease of use to recognize the Subnet easier
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}
+
+  # This defines the Routing Tables for our subnets
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      # Link to the VPC the Routing Table belongs to
+      VpcId: !Ref VMvpc
+
+      # Set a tag, for ease of use to recognize the Routing Table easier
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}
+
+  # This defines the routes. Public route table has direct routing to IGW
+  PublicRouteVM:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref VMInternetGateway
+
+  # Associate Routing Table to Subnet
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref VMSubnet
+  ElasticIPAddress:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref VM
+      # Set a tag, for ease of use to recognize the EIP easier
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}
